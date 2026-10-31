@@ -327,6 +327,18 @@ def test_graduated_actions_space_challenge_and_refuse(
 	assert not policy.redeem(challenge, "q 10", counter, now=100.0)
 	late = decisions[11]
 	assert not policy.redeem(late, "q 11", solve(late.challenge)[0], now=1000.0)  # type: ignore[arg-type]
+	# An outstanding proof cannot bypass a later policy escalation.
+	escalated = policy.admit("c", "warmup", now=100.0)
+	for i in range(9):
+		escalated = policy.admit("c", f"escalate {i}", now=100.0)
+	assert escalated.challenge is not None
+	escalation_counter, _ = solve(escalated.challenge)
+	with policy.store.transaction() as tx:
+		state = tx.account("c")
+		assert state is not None
+		state.level = 4
+		tx.put_account("c", state)
+	assert not policy.redeem(escalated, "escalate 8", escalation_counter, now=100.0)
 	forced.thresholds["paper"].thresholds = [-1, -1, -1, -1]
 	blocked = MMDPolicy(forced, scorer, encoder=FakeEncoder())
 	outcome = [blocked.admit("b", f"q {i}", now=0.0) for i in range(12)]
