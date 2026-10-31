@@ -99,7 +99,7 @@ def _key(settings: Settings) -> bytes | None:
 
 	A persisted key keeps noise consistent across restarts and keeps watermark tests possible.
 	"""
-	if settings.l4_action != "deceive":
+	if settings.l4_action != "deceive" or settings.policy_version == "verify-risk-v2":
 		return None
 	if settings.deception_key:
 		key = bytes.fromhex(settings.deception_key)
@@ -174,6 +174,7 @@ def create_app(
 			deception_rate=config.deception_rate,
 			deception_key=key,
 			actions=config.actions,
+			policy_version=config.policy_version,
 		)
 	else:
 		policy = make_policy(config.policy, calibration, scorer)

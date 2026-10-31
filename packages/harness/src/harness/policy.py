@@ -48,6 +48,7 @@ class Decision:
 	# When a window raises the level: the window's requests with the largest MMD witness,
 	# as (request digest, witness) pairs, most anomalous first.
 	witness: tuple[tuple[str, float], ...] = ()
+	horizon_start: float | None = None
 
 	def client_view(self) -> dict[str, Any]:
 		view: dict[str, Any] = {"action": self.action, "release_at": self.release_at}
@@ -214,15 +215,20 @@ class MMDPolicy(_HorizonPolicy):
 		deception_key: bytes | None = None,
 		witness_size: int = 5,
 		actions: Literal["graduated", "direct"] = "graduated",
+		policy_version: Literal["legacy-v1", "verify-risk-v2"] = "legacy-v1",
 	) -> None:
 		calibration.require_current_policy()
 		config: HarnessConfig = calibration.config
 		if config.task == "coding" and l4_action == "deceive":
 			raise ValueError("coding deception is not implemented; use L4 refusal")
-		if l4_action == "deceive" and not deception_key:
+		if l4_action == "deceive" and policy_version == "legacy-v1" and not deception_key:
 			raise ValueError("deception needs a secret key")
 		if not 0 <= deception_rate <= 1:
 			raise ValueError("deception_rate must be in [0, 1]")
+		if policy_version not in ("legacy-v1", "verify-risk-v2"):
+			raise ValueError("unknown policy version")
+		if policy_version == "verify-risk-v2" and actions != "graduated":
+			raise ValueError("verify-risk-v2 requires graduated actions")
 		super().__init__(config.horizon_seconds, config.horizon_attempts)
 		if accumulator not in calibration.thresholds:
 			raise ValueError(f"the calibration has no thresholds for {accumulator!r}")
@@ -241,12 +247,13 @@ class MMDPolicy(_HorizonPolicy):
 		self.deception_key = deception_key or b""
 		self.witness_size = witness_size
 		self.actions: Literal["graduated", "direct"] = actions
+		self.policy_version = policy_version
 
 	def _respond(
 		self, account: str, state: AccountState, text: str, now: float, binding: str
 	) -> tuple[Action, float, Challenge | None, bool]:
 		"""The action, release time, challenge, and deception flag for the current level."""
-		if state.level >= 4 and self.l4_action == "refuse":
+		if state.level >= 4 and self.l4_action == "refuse" and self.policy_version == "legacy-v1":
 			return "refuse", now, None, False
 		if state.level < 2:
 			# An L0 or L1 admission still counts as the previous release, so L2 spacing
@@ -258,8 +265,10 @@ class MMDPolicy(_HorizonPolicy):
 		if state.level < 3:
 			return "serve", release_at, None, False
 		challenge = self.challenges.issue(account, request_digest(binding), now)
-		deceive = state.level >= 4 and (
-			keyed_unit(self.deception_key, "rate", request_digest(text)) < self.deception_rate
+		deceive = (
+			self.policy_version == "legacy-v1"
+			and state.level >= 4
+			and (keyed_unit(self.deception_key, "rate", request_digest(text)) < self.deception_rate)
 		)
 		return "challenge", release_at, challenge, deceive
 
@@ -280,7 +289,14 @@ class MMDPolicy(_HorizonPolicy):
 		if state.level >= 4:
 			action, release_at, challenge, deceive = self._respond(account, state, text, now, bound)
 			return Decision(
-				account, state.attempts, 4, action, release_at, challenge=challenge, deceive=deceive
+				account,
+				state.attempts,
+				4,
+				action,
+				release_at,
+				challenge=challenge,
+				deceive=deceive,
+				horizon_start=state.horizon_start,
 			)
 		if embedding is None:
 			if self.encoder is None:
@@ -323,6 +339,7 @@ class MMDPolicy(_HorizonPolicy):
 			statistic=state.statistic,
 			deceive=deceive,
 			witness=witness,
+			horizon_start=state.horizon_start,
 		)
 
 	def redeem(self, decision: Decision, binding: str, counter: int, now: float) -> bool:
@@ -332,6 +349,16 @@ class MMDPolicy(_HorizonPolicy):
 		"""
 		if decision.challenge is None:
 			raise ValueError("this decision has no challenge")
+		if self.policy_version == "verify-risk-v2":
+			state = self.accounts.get(decision.account)
+			if (
+				state is None
+				or state.horizon_start != decision.horizon_start
+				or now - state.horizon_start >= self.horizon_seconds
+				or state.attempts > self.horizon_attempts
+				or state.level > decision.level
+			):
+				return False
 		return self.challenges.redeem(
 			decision.challenge.nonce, decision.account, request_digest(binding), counter, now
 		)

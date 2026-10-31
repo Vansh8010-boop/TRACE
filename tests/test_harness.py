@@ -97,6 +97,52 @@ def test_thresholds_use_strict_exceedance_and_report_achieved_rates() -> None:
 	assert forced.thresholds == [3, 4, 4]
 	assert forced.achieved == [0.4, 0.2, 0.2]
 	assert nested_thresholds([1, 2], [0.01], [True, True]).achieved == [1.0]
+	assert forced.level_results is not None
+	assert [row["target"] for row in forced.level_results] == [0.4, 0.2, 0.01]
+	assert [row["reached"] for row in forced.level_results] == [2, 1, 1]
+	assert [row["capped"] for row in forced.level_results] == [1, 1, 1]
+	assert forced.level_results[0]["scored"] == 5
+
+
+def test_level_resolution_and_legacy_evidence(calibrated: tuple[Calibration, WindowScorer]) -> None:
+	calibration = calibrated[0].model_copy(deep=True)
+	report = calibration.adequacy(accumulators=("paper",), levels=(1, 4))
+	assert report["levels"]["L1"]["minimum_policy_horizons"] == 10
+	assert report["levels"]["L4"]["minimum_policy_horizons"] == 100
+	result = report["levels"]["L1"]["results"]["paper"]
+	assert result["scored"] == 200 and result["censored"] == 0
+	assert result["upper95"] >= result["achieved"]
+	calibration.thresholds["paper"].level_results = None
+	legacy = Calibration.model_validate_json(calibration.model_dump_json())
+	assert (
+		legacy.adequacy(accumulators=("paper",))["levels"]["L1"]["evidence_version"]
+		== "legacy-inferred"
+	)
+	calibration.thresholds["paper"].level_results = []
+	assert not calibration.adequacy(accumulators=("paper",), levels=(4,))["passed"]
+	with pytest.raises(ValueError):
+		HarnessConfig(level_targets=(0.1, 0.2, 0.02, 0.01))
+
+
+def test_risk_verification_rejects_stale_and_capped_proofs(
+	calibrated: tuple[Calibration, WindowScorer],
+) -> None:
+	calibration, scorer = calibrated
+	calibration = calibration.model_copy(deep=True)
+	calibration.config.horizon_attempts = 2
+	policy = MMDPolicy(calibration, scorer, difficulty=1, policy_version="verify-risk-v2")
+	policy.admit("a", "first", 0, embedding=np.zeros(DIMENSION))
+	state = policy.accounts["a"]
+	state.level = 3
+	challenge = policy.admit("a", "second", 1, embedding=np.zeros(DIMENSION))
+	assert challenge.challenge is not None
+	answer = solve(challenge.challenge)[0]
+	state.level = 4
+	assert not policy.redeem(challenge, "second", answer, 1)
+	state.level = 3
+	assert policy.admit("a", "third", 2, embedding=np.zeros(DIMENSION)).action == "refuse"
+	assert not policy.redeem(challenge, "second", answer, 2)
+	assert not policy.redeem(challenge, "second", answer, calibration.config.horizon_seconds)
 
 
 def test_calibration_adequacy_rejects_small_pools_and_overlapping_window_inflation(
@@ -111,6 +157,7 @@ def test_calibration_adequacy_rejects_small_pools_and_overlapping_window_inflati
 	calibration.calibration_scores = [0.0] * 1000
 	calibration.thresholds["paper"].thresholds = [1.0] * 4
 	calibration.thresholds["paper"].units = 2
+	calibration.thresholds["paper"].level_results = None
 	report = calibration.adequacy(accumulators=("paper",))
 	assert report["passed"] is False
 	assert report["minimum_score_windows"] == 99
@@ -182,6 +229,7 @@ def test_calibration_adequacy_checks_selected_defenses_and_legacy_counts(
 	calibration.counts["score_calibration_independent_windows"] = 99
 	calibration.thresholds["paper"].thresholds = [1.0, 2.0, 3.0, 4.0]
 	calibration.thresholds["paper"].units = 100
+	calibration.thresholds["paper"].level_results = None
 	assert calibration.adequacy(accumulators=("paper",))["passed"] is True
 	calibration.thresholds["instantaneous"].thresholds = [1.0] * 4
 	assert calibration.adequacy(accumulators=("instantaneous",))["passed"] is False
